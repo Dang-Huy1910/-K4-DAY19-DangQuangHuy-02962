@@ -13,9 +13,40 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+T = TypeVar("T")
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    """Return wait time for 429 / quota errors, else None."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    text = str(error)
+    if status not in (429, 503) and "RateLimit" not in type(error).__name__ and "429" not in text and "RESOURCE_EXHAUSTED" not in text:
+        return None
+    match = re.search(r"retry in ([\d.]+)\s*s", text, re.I)
+    if match:
+        return float(match.group(1)) + 1.0
+    return 15.0
+
+
+def _call_with_retry(fn: Callable[[], T], attempts: int = 10) -> T:
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as error:
+            wait = _retry_after_seconds(error)
+            if wait is None or attempt == attempts:
+                raise
+            wait = max(wait, delay)
+            print(f"[rate-limit] chờ {wait:.1f}s (lần {attempt}/{attempts})")
+            time.sleep(wait)
+            delay = min(delay * 2, 60.0)
+    raise RuntimeError("retry exhausted")
 
 PROVIDERS = {
     "openai": {"key": "OPENAI_API_KEY", "base_url": None,
@@ -37,6 +68,7 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),  # Gemini API; 2.5-flash-lite no longer available to new keys
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -113,25 +145,35 @@ class MeteredLLM:
             self._chat_client = _openai_client(self.chat_provider)
         self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
                               else _openai_client(self.embed_provider))
+        self._last_chat_at = 0.0
+
+    def _pace_gemini_chat(self) -> None:
+        """Free-tier Gemini is ~15 generateContent RPM; keep a gap between calls."""
+        if self.chat_provider != "gemini":
+            return
+        gap = 4.2
+        wait = gap - (time.perf_counter() - self._last_chat_at)
+        if wait > 0:
+            time.sleep(wait)
 
     def chat(self, prompt: str, json_mode: bool = False) -> str:
         start = time.perf_counter()
         if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
+            text, model, tokens_in, tokens_out = _call_with_retry(lambda: self._chat_anthropic(prompt))
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
+            def _create():
+                kwargs: dict[str, Any] = dict(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                 )
+                if json_mode and self.chat_provider != "gemini":
+                    kwargs["response_format"] = {"type": "json_object"}
+                return self._chat_client.chat.completions.create(**kwargs)
+
+            self._pace_gemini_chat()
+            response = _call_with_retry(_create)
+            self._last_chat_at = time.perf_counter()
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +200,9 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = _call_with_retry(
+            lambda: self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        )
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
